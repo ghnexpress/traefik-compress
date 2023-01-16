@@ -1,8 +1,8 @@
-module github.com/ghnexpress/traefik-cache
+module github.com/ghnexpress/traefik-compress
 
 go 1.19
 
 require (
-	github.com/bradfitz/gomemcache v0.0.0-20221031212613-62deef7fc822
-	github.com/pquerna/cachecontrol v0.1.0
+	github.com/andybalholm/brotli v1.0.4
+	github.com/klauspost/compress v1.15.14
 )

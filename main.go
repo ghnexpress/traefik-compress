@@ -1,215 +1,162 @@
-package traefik_cache
+package traefik_compress
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"log"
+	"mime"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/ghnexpress/traefik-cache/constants"
-	"github.com/ghnexpress/traefik-cache/log"
-	"github.com/ghnexpress/traefik-cache/model"
-	"github.com/ghnexpress/traefik-cache/repo"
-	"github.com/ghnexpress/traefik-cache/utils"
-	"github.com/pquerna/cachecontrol"
+	"github.com/ghnexpress/traefik-compress/brotli"
+	"github.com/klauspost/compress/gzhttp"
 )
 
-var (
-	cacheRepo           repo.Repository
-	onceMemcached       = make(map[string]*sync.Once)
-	onceMemcachedMutex  = sync.RWMutex{}
-	defaultForceExpired = 60 * 60
-	ignoreHeaderFields  = []string{"X-Request-Id", "Postman-Token", "Content-Length"}
-)
+const typeName = "Compress"
 
-const (
-	X_REQUEST_ID_HEADER = "X-Request-Id"
-	CACHE_HEADER        = "cache-status"
-	MASTER_ENV          = "master"
-	DEV_ENV             = "dev"
-)
+// DefaultMinSize is the default minimum size (in bytes) required to enable compression.
+// See https://github.com/klauspost/compress/blob/9559b037e79ad673c71f6ef7c732c00949014cd2/gzhttp/compress.go#L47.
+const DefaultMinSize = 1024
 
-func CreateConfig() *model.Config {
-	return &model.Config{
-		Memcached: model.MemcachedConfig{},
-		HashKey:   model.HashKey{Method: model.Enable{Enable: true}},
-		Env:       MASTER_ENV,
-	}
+// Compress is a middleware that allows to compress the response.
+type compress struct {
+	next     http.Handler
+	name     string
+	excludes []string
+	minSize  int
+
+	brotliHandler http.Handler
+	gzipHandler   http.Handler
 }
 
-type Cache struct {
-	name      string
-	next      http.Handler
-	log       log.Log
-	config    model.Config
-	cacheRepo repo.Repository
-}
+// New creates a new compress middleware.
+func New(ctx context.Context, next http.Handler, conf Compress, name string) (http.Handler, error) {
+	log.Println("Creating middleware")
 
-func New(_ context.Context, next http.Handler, config *model.Config, name string) (http.Handler, error) {
-	log := log.New(config.Env, config.Alert.Telegram)
-	log.ConsoleLog("config", config)
-
-	onceMemcachedMutex.Lock()
-	onceKey := fmt.Sprintf("%+v", config.Memcached)
-	if onceMemcached[onceKey] == nil {
-		onceMemcached[onceKey] = &sync.Once{}
-	}
-
-	onceMemcached[onceKey].Do(func() {
-		cacheRepo = repo.NewRepoManager(config.Memcached)
-	})
-	onceMemcachedMutex.Unlock()
-
-	return &Cache{
-		name:      name,
-		next:      next,
-		log:       log,
-		config:    *config,
-		cacheRepo: cacheRepo,
-	}, nil
-}
-
-func (c *Cache) key(r *http.Request) (string, error) {
-	hashKey := c.config.HashKey
-
-	hMethod := ""
-	if hashKey.Method.Enable {
-		hMethod = r.Method
-	}
-
-	hHeader := ""
-	if hashKey.Header.Enable && r.Header != nil {
-		h := r.Header.Clone()
-
-		if hashKey.Header.Fields != "" {
-			rawHeader := ""
-			headerFields := strings.Split(hashKey.Header.Fields, ",")
-			for _, field := range headerFields {
-				rawHeader = fmt.Sprintf("%s|%s", rawHeader, h.Get(field))
-			}
-
-			hHeader = utils.GetMD5Hash([]byte(rawHeader))
-		} else {
-			if hashKey.Header.IgnoreFields != "" {
-				ignoreHeaderFields = strings.Split(hashKey.Header.IgnoreFields, ",")
-			}
-
-			for _, field := range ignoreHeaderFields {
-				h.Del(field)
-			}
-
-			hHeader = utils.GetMD5Hash([]byte(fmt.Sprintf("%+v", h)))
-		}
-	}
-
-	hBody := ""
-	if hashKey.Body.Enable && r.Body != nil {
-		bodyBytes, err := ioutil.ReadAll(r.Body)
+	excludes := []string{"application/grpc"}
+	for _, v := range conf.ExcludedContentTypes {
+		mediaType, _, err := mime.ParseMediaType(v)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
-		r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
-		hBody = utils.GetMD5Hash(bodyBytes)
+		excludes = append(excludes, mediaType)
 	}
 
-	return utils.GetMD5Hash([]byte(fmt.Sprintf("%s%s|%s|%s|%s", r.Host, r.URL.String(), hMethod, hHeader, hBody))), nil
+	minSize := DefaultMinSize
+	if conf.MinResponseBodyBytes > 0 {
+		minSize = conf.MinResponseBodyBytes
+	}
+
+	c := &compress{
+		next:     next,
+		name:     name,
+		excludes: excludes,
+		minSize:  minSize,
+	}
+
+	var err error
+	c.brotliHandler, err = c.newBrotliHandler()
+	if err != nil {
+		return nil, err
+	}
+
+	c.gzipHandler, err = c.newGzipHandler()
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
-func (c *Cache) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	requestID := req.Header.Get(X_REQUEST_ID_HEADER)
+func (c *compress) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
-	key, err := c.key(req)
-	if err != nil {
-		c.log.TelegramLog(requestID, fmt.Errorf("Build key memcached error: %v", err))
-
-		rw.Header().Set(CACHE_HEADER, string(constants.ErrorCacheStatus))
-
+	if req.Method == http.MethodHead {
 		c.next.ServeHTTP(rw, req)
-
 		return
 	}
 
-	value, err := c.cacheRepo.Get(key)
+	mediaType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
 	if err != nil {
-		c.log.TelegramLog(requestID, err)
+		log.Println("Unable to parse MIME type")
+	}
 
-		rw.Header().Set(CACHE_HEADER, string(constants.ErrorCacheStatus))
-
+	// Notably for text/event-stream requests the response should not be compressed.
+	// See https://github.com/traefik/traefik/issues/2576
+	if contains(c.excludes, mediaType) {
 		c.next.ServeHTTP(rw, req)
-
 		return
 	}
 
-	if value != nil {
-		for key, vals := range value.Headers {
-			for _, val := range vals {
-				rw.Header().Add(key, val)
-			}
-		}
-
-		rw.Header().Set(CACHE_HEADER, string(constants.HitCacheStatus))
-		if c.config.Env == DEV_ENV {
-			rw.Header().Set("debug-cache-traefik", fmt.Sprintf("time: %s, key: %s", time.Now().Format(time.RFC3339), key))
-		}
-
-		rw.WriteHeader(value.Status)
-		if _, err := rw.Write(value.Body); err != nil {
-			c.log.TelegramLog(requestID, fmt.Errorf("Write data from cache to response body error: %v", err))
-
-			if err := c.cacheRepo.Delete(key); err != nil {
-				c.log.TelegramLog(requestID, err)
-			}
-		}
-		return
-	}
-
-	rw.Header().Set(CACHE_HEADER, string(constants.MissCacheStatus))
-	checkCompress := rw.Header().Get("Vary")
-
-	r := &ResponseWriter{ResponseWriter: rw}
-
-	c.next.ServeHTTP(r, req)
-
-	force := c.config.ForceCache
-	ok := force.Enable
-	expiredTime := time.Now().Add(time.Second * time.Duration(force.ExpiredTime))
-	if ok && force.ExpiredTime <= 0 {
-		expiredTime = time.Now().Add(time.Second * time.Duration(defaultForceExpired))
-	}
+	// Client allows us to do whatever we want, so we br compress.
+	// See https://www.rfc-editor.org/rfc/rfc9110.html#section-12.5.3
+	acceptEncoding, ok := req.Header["Accept-Encoding"]
 	if !ok {
-		expiredTime, ok = c.cacheable(req, rw, r.status)
+		c.brotliHandler.ServeHTTP(rw, req)
+		return
 	}
 
-	if ok {
-		// Router --> Compress Middleware --> Cache Middleware --> Service
-		if checkCompress != "" {
-			r.Header().Del("Content-Encoding")
-			r.Header().Del("Vary")
-		}
-
-		err = c.cacheRepo.SetExpires(key, expiredTime, model.Cache{
-			Status:  r.status,
-			Headers: r.Header(),
-			Body:    r.body,
-		})
-
-		if err != nil {
-			c.log.TelegramLog(requestID, err)
-		}
+	if encodingAccepts(acceptEncoding, "br") {
+		c.brotliHandler.ServeHTTP(rw, req)
+		return
 	}
+
+	if encodingAccepts(acceptEncoding, "gzip") {
+		c.gzipHandler.ServeHTTP(rw, req)
+		return
+	}
+
+	c.next.ServeHTTP(rw, req)
 }
 
-func (c *Cache) cacheable(req *http.Request, rw http.ResponseWriter, status int) (time.Time, bool) {
-	reasons, expiredTime, err := cachecontrol.CachableResponseWriter(req, status, rw, cachecontrol.Options{})
-
-	if err != nil || len(reasons) > 0 || expiredTime.Before(time.Now()) {
-		return time.Time{}, false
+func (c *compress) newGzipHandler() (http.Handler, error) {
+	wrapper, err := gzhttp.NewWrapper(
+		gzhttp.ExceptContentTypes(c.excludes),
+		gzhttp.MinSize(c.minSize),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new gzip wrapper: %w", err)
 	}
 
-	return expiredTime, true
+	return wrapper(c.next), nil
+}
+
+func (c *compress) newBrotliHandler() (http.Handler, error) {
+	cfg := brotli.Config{
+		ExcludedContentTypes: c.excludes,
+		MinSize:              c.minSize,
+	}
+
+	wrapper, err := brotli.NewWrapper(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("new brotli wrapper: %w", err)
+	}
+
+	return wrapper(c.next), nil
+}
+
+func encodingAccepts(acceptEncoding []string, typ string) bool {
+	for _, ae := range acceptEncoding {
+		for _, e := range strings.Split(ae, ",") {
+			parsed := strings.Split(strings.TrimSpace(e), ";")
+			if len(parsed) == 0 {
+				continue
+			}
+			if parsed[0] == typ || parsed[0] == "*" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func contains(values []string, val string) bool {
+	for _, v := range values {
+		if v == val {
+			return true
+		}
+	}
+
+	return false
 }
